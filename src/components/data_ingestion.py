@@ -1,57 +1,44 @@
-import os
-import sys
-import time
-from dataclasses import dataclass
+import os, os.path as op, argparse, json, glob, numpy as np
+from typing import Dict
 
-import pandas as pd
-from sklearn.model_selection import train_test_split
+def load_npz_labels(npz_path: str, split: str) -> Dict[str, dict]:
+    d = np.load(npz_path, allow_pickle=True)
+    key = f"{split}_corpus"
+    if key not in d:
+        raise ValueError(f"Split '{split}' not found in {npz_path}. Keys: {list(d.keys())}")
+    return d[key].item()  # {name: {'emo':..., 'val':...}}
 
-from src.exceptions import CustomException
-from src.logger import logging
-from src.components.data_transformation import *
-from src.components.model_trainer import *
+def index_videos(video_dir: str) -> Dict[str,str]:
+    idx = {}
+    for p in glob.glob(op.join(video_dir, "*")):
+        if op.isfile(p):
+            idx[op.splitext(op.basename(p))[0]] = p
+    return idx
 
-@dataclass
-class DataIngestionConfig:
-    artifacts_dir: str = "artifacts"
-    train_data_path: str = os.path.join("data", "train.parquet")
-    test_data_path: str  = os.path.join("data", "test.parquet")
+def write_manifest(video_dir: str, npz_path: str, split: str, out_path: str) -> int:
+    os.makedirs(op.dirname(out_path), exist_ok=True)
+    labels = load_npz_labels(npz_path, split)
+    vids = index_videos(video_dir)
+    n = 0
+    with open(out_path, "w") as f:
+        for name, info in labels.items():
+            vp = vids.get(name)
+            if not vp:
+                continue
+            rec = {"name": name, "split": split, "video": vp, "label": info.get("emo","neutral"), "text": ""}
+            f.write(json.dumps(rec) + "\n")
+            n += 1
+    return n
 
-class DataIngestion:
-    def __init__(self, src_parquet: str = "artifacts/train-00000-of-00127.parquet"):
-        self.src_parquet = src_parquet
-        self.ingestion_config = DataIngestionConfig()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--video_dir", required=True)
+    ap.add_argument("--npz", required=True)  # /mnt/merbig/dataset-process/label-6way.npz
+    ap.add_argument("--split", choices=["train","test1","test2","test3"], required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    n = write_manifest(args.video_dir, args.npz, args.split, args.out)
+    print(f" wrote {n} rows → {args.out}")
 
-    def initiate_data_ingestion(self):
-        logging.info("Entered the data ingestion method/component")
-        try:
-
-            t0 = time.time()
-            df = pd.read_parquet(self.src_parquet, engine="pyarrow")
-            logging.info(f"READ: {df.shape} in {time.time()-t0:.1f}s")
-
-            t1 = time.time()
-            train_set, test_set = train_test_split(df, test_size=0.2, random_state=42)
-            logging.info(f"SPLIT: {time.time()-t1:.1f}s")
-            logging.info(f"SPLIT: {train_set.shape} and {test_set.shape} in {time.time()-t0:.1f}s")
-
-            t2 = time.time()
-            train_set.to_parquet(self.ingestion_config.train_data_path, index=False,
-                                engine="pyarrow", compression="zstd")
-            logging.info(f"WRITE train: {time.time()-t2:.1f}s")
-
-            t3 = time.time()
-            test_set.to_parquet(self.ingestion_config.test_data_path, index=False,
-                                engine="pyarrow", compression="zstd")
-            logging.info(f"WRITE test : {time.time()-t3:.1f}s")
-
-            logging.info(f"TOTAL: {time.time()-t0:.1f}s")
-
-            logging.info("Ingestion of the data is complete")
-            return (
-                self.ingestion_config.train_data_path,
-                self.ingestion_config.test_data_path,
-            )
-
-        except Exception as e:
-            raise CustomException(e, sys)
+if __name__ == "__main__":
+    main()

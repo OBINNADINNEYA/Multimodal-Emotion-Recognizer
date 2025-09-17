@@ -2,9 +2,7 @@
 MER End2End
 
 
-
 # MER2023 Dataset Setup (Azure Blob + VM)
-
 This document explains step-by-step how I prepared the **MER2023 dataset** for use in my project, using Azure Blob Storage and an Azure VM. It covers:
 
 1. Creating the storage container  
@@ -17,7 +15,6 @@ This document explains step-by-step how I prepared the **MER2023 dataset** for u
 ---
 
 ## 0. Prerequisites
-
 - Azure Subscription
 - Hugging Face account with **read token** and MER2023 terms accepted
 - Local machine with Python 3.10+ and `pip`
@@ -26,7 +23,6 @@ This document explains step-by-step how I prepared the **MER2023 dataset** for u
 ---
 
 ## 1. Azure Storage + Container
-
 - **Storage account**: `mymlprojectsstorage`  
 - **Container**: `merdata-23`  
 
@@ -68,3 +64,33 @@ Automatic retries
 Idempotent (overwrite=True)
 Run:
 python upload_mer_parallel.py
+
+
+
+
+#HOW TO RUN 
+# build manifests
+python3 -m src.components.data_ingestion \
+  --video_dir /mnt/merbig/dataset-process/video \
+  --npz /mnt/merbig/dataset-process/label-6way.npz \
+  --split train \
+  --out data/manifests/train.jsonl
+
+head -n 300 data/manifests/train.jsonl > data/manifests/train_300.jsonl
+
+# features
+python3 -m src.components.data_transformation \
+  --manifest data/manifests/train.jsonl \
+  --outdir data/features/train \
+  --device cpu
+
+# train
+python3 -m src.components.model_trainer \
+  --features_dir data/features/train \
+  --model_out models/mer_baseline.pkl
+
+# evaluate
+python3 -m src.components.model_evaluator \
+  --features_dir data/features/train_300 \
+  --model models/mer_baseline.pkl \
+  --report_out reports/train_300_report.txt
