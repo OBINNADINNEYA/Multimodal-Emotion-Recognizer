@@ -1,5 +1,7 @@
-#all data
+#all data and logs
 data/
+artifacts/
+logs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

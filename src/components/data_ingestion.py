@@ -1,44 +1,85 @@
-import os, os.path as op, argparse, json, glob, numpy as np
-from typing import Dict
+# src/components/data_ingestion.py
+import os
+import sys
+import json
+import numpy as np
+from dataclasses import dataclass
+from pathlib import Path
 
-def load_npz_labels(npz_path: str, split: str) -> Dict[str, dict]:
-    d = np.load(npz_path, allow_pickle=True)
-    key = f"{split}_corpus"
-    if key not in d:
-        raise ValueError(f"Split '{split}' not found in {npz_path}. Keys: {list(d.keys())}")
-    return d[key].item()  # {name: {'emo':..., 'val':...}}
+from src.exceptions import CustomException
+from src.logger import logging
 
-def index_videos(video_dir: str) -> Dict[str,str]:
-    idx = {}
-    for p in glob.glob(op.join(video_dir, "*")):
-        if op.isfile(p):
-            idx[op.splitext(op.basename(p))[0]] = p
-    return idx
 
-def write_manifest(video_dir: str, npz_path: str, split: str, out_path: str) -> int:
-    os.makedirs(op.dirname(out_path), exist_ok=True)
-    labels = load_npz_labels(npz_path, split)
-    vids = index_videos(video_dir)
-    n = 0
-    with open(out_path, "w") as f:
-        for name, info in labels.items():
-            vp = vids.get(name)
-            if not vp:
-                continue
-            rec = {"name": name, "split": split, "video": vp, "label": info.get("emo","neutral"), "text": ""}
-            f.write(json.dumps(rec) + "\n")
-            n += 1
-    return n
+@dataclass
+class DataIngestionConfig:
+    artifacts_dir: str = "artifacts"
+    manifests_dir: str = os.path.join("artifacts", "manifests")
+    video_dir: str = "/mnt/merbig/dataset-process/video"  # adjust if needed
+    label_npz: str = "/mnt/merbig/dataset-process/label-6way.npz"
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--video_dir", required=True)
-    ap.add_argument("--npz", required=True)  # /mnt/merbig/dataset-process/label-6way.npz
-    ap.add_argument("--split", choices=["train","test1","test2","test3"], required=True)
-    ap.add_argument("--out", required=True)
-    args = ap.parse_args()
-    n = write_manifest(args.video_dir, args.npz, args.split, args.out)
-    print(f" wrote {n} rows → {args.out}")
 
-if __name__ == "__main__":
-    main()
+class DataIngestion:
+    def __init__(self):
+        self.config = DataIngestionConfig()
+        Path(self.config.manifests_dir).mkdir(parents=True, exist_ok=True)
+
+    def build_manifest(self, split: str):
+        """
+        Build manifest JSONL for a given split.
+        Each line = {"video": path, "label": emotion or None}
+        """
+        try:
+            logging.info(f"Building manifest for split={split}")
+
+            # Load label npz
+            data = np.load(self.config.label_npz, allow_pickle=True)
+            key = f"{split}_corpus"
+            if key not in data:
+                raise CustomException(
+                    f"Split '{split}' not found in {self.config.label_npz}. Keys={list(data.keys())}"
+                )
+
+            corpus = data[key].item()
+            out_path = os.path.join(self.config.manifests_dir, f"{split}.jsonl")
+
+            written = 0
+            with open(out_path, "w", encoding="utf-8") as fout:
+                for vid, meta in corpus.items():
+                    # videos are usually .avi, fallback to .mp4
+                    video_path = os.path.join(self.config.video_dir, f"{vid}.avi")
+                    if not os.path.exists(video_path):
+                        video_path = os.path.join(self.config.video_dir, f"{vid}.mp4")
+                    if not os.path.exists(video_path):
+                        logging.warning(f"Missing video for {vid}, skipping")
+                        continue
+
+                    label = meta.get("emo") if "emo" in meta else None
+                    entry = {"video": video_path, "label": label}
+                    fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    written += 1
+
+            logging.info(f"Wrote {written} rows → {out_path}")
+            return out_path
+
+        except Exception as e:
+            raise CustomException(e, sys)
+
+    def initiate_data_ingestion(self, splits=None):
+        """
+        Orchestrates manifest building for train/test splits.
+        """
+        try:
+            if splits is None:
+                splits = ["train", "test3"]
+
+            outputs = {}
+            for split in splits:
+                outputs[split] = self.build_manifest(split)
+
+            logging.info(" Data ingestion completed")
+            return outputs
+
+        except Exception as e:
+            raise CustomException(e, sys)
+
+
