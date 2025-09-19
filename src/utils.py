@@ -69,8 +69,6 @@ def timestamp():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-
-
 def ensure_wav16k(video_path: str) -> str:
     """
     Convert video/audio file into temporary 16kHz mono WAV.

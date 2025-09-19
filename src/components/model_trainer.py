@@ -1,71 +1,54 @@
-import os, os.path as op, argparse, glob, numpy as np, joblib
+# src/components/model_trainer.py
+import os, sys, glob, joblib, numpy as np
+from dataclasses import dataclass
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import classification_report
+from src.exceptions import CustomException
+from src.logger import logging
 
-# Torch for MLP + Transformer
-import torch
-import torch.nn as nn
-import torch.optim as optim
+import torch, torch.nn as nn, torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 
-# -------------------------
-# Data loading
-# -------------------------
-def load_features(ft_dir: str, use_text: bool):
-    A, V, T, y = [], [], [], []
-    for p in glob.glob(op.join(ft_dir,"*.npz")):
-        d = np.load(p, allow_pickle=True)
-        xa, xv = d["x_audio"], d["x_video"]
-        xt = d["x_text"] if use_text and "x_text" in d else np.zeros(1, dtype=np.float32)
-        A.append(xa.astype(np.float32))
-        V.append(xv.astype(np.float32))
-        T.append(xt.astype(np.float32))
-        y.append(d["y"].item() if d["y"].shape==() else str(d["y"]))
-    return np.stack(A), np.stack(V), np.stack(T), np.array(y)
+
+@dataclass
+class ModelTrainerConfig:
+    model_out: str = os.path.join("artifacts", "model.pkl")
+    preprocessor_out: str = os.path.join("artifacts", "preprocessor.pkl")
+
 
 # -------------------------
-# Models
+# Torch MLP
 # -------------------------
 class SimpleMLP(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, num_classes)
+            nn.Linear(input_dim, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU(),
+            nn.Linear(64, num_classes)
         )
-    def forward(self, x): return self.net(x)
+    def forward(self, x): 
+        return self.net(x)
 
-class TinyTransformer(nn.Module):
-    def __init__(self, d_model, num_classes, nhead=2, num_layers=1):
-        super().__init__()
-        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-        self.cls = nn.Linear(d_model, num_classes)
 
-    def forward(self, tokens):  # tokens shape [batch, 3, d_model]
-        x = tokens.permute(1,0,2)  # [seq,batch,dim]
-        out = self.encoder(x)      # same shape
-        pooled = out.mean(0)       # [batch,dim]
-        return self.cls(pooled)
-
-# -------------------------
-# Training helpers
-# -------------------------
-def train_torch_model(model, Xtr, ytr, Xte, yte, epochs=50, batch_size=64, lr=1e-3):
+def train_mlp(Xtr, ytr, Xte, yte, epochs=50, batch_size=64, lr=1e-3):
+    logging.info("Training MLP (PyTorch)")
     classes = np.unique(ytr)
-    cls2id = {c:i for i,c in enumerate(classes)}
+    cls2id = {c: i for i, c in enumerate(classes)}
     ytr_id = np.array([cls2id[c] for c in ytr])
     yte_id = np.array([cls2id[c] for c in yte])
 
-    tr_loader = DataLoader(TensorDataset(torch.tensor(Xtr).float(), torch.tensor(ytr_id).long()),
-                           batch_size=batch_size, shuffle=True)
+    tr_loader = DataLoader(
+        TensorDataset(torch.tensor(Xtr).float(), torch.tensor(ytr_id).long()),
+        batch_size=batch_size, shuffle=True
+    )
     te_tensor = torch.tensor(Xte).float()
-    te_labels = torch.tensor(yte_id).long()
 
+    model = SimpleMLP(Xtr.shape[1], len(classes))
     opt = optim.Adam(model.parameters(), lr=lr)
     crit = nn.CrossEntropyLoss()
 
@@ -76,78 +59,131 @@ def train_torch_model(model, Xtr, ytr, Xte, yte, epochs=50, batch_size=64, lr=1e
             loss = crit(model(xb), yb)
             loss.backward()
             opt.step()
-        if (ep+1)%5==0: print(f"Epoch {ep+1}/{epochs} loss={loss.item():.4f}")
+        if (ep+1) % 5 == 0:
+            logging.info(f"MLP epoch {ep+1}/{epochs}, loss={loss.item():.4f}")
 
     model.eval()
     with torch.no_grad():
         preds = model(te_tensor).argmax(1).numpy()
-    report = classification_report(yte_id, preds, target_names=classes)
-    return model, cls2id, report
+    score = f1_score(yte_id, preds, average="macro")
+    logging.info(f"MLP validation f1_macro={score:.3f}")
+    return model, cls2id, score
+
 
 # -------------------------
-# Main
+# Trainer Class
 # -------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--features_dir", required=True)
-    ap.add_argument("--model_out", required=True)
-    ap.add_argument("--model_type", choices=["logreg","mlp","transformer","latefusion"], default="logreg")
-    ap.add_argument("--use_text", action="store_true")
-    args = ap.parse_args()
+class ModelTrainer:
+    def __init__(self):
+        self.config = ModelTrainerConfig()
 
-    A, V, T, y = load_features(args.features_dir, args.use_text)
-    # concatenate if needed
-    if args.model_type in ["logreg","mlp"]:
-        X = np.concatenate([A,V,T], axis=1) if args.use_text else np.concatenate([A,V], axis=1)
-        Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    def _load_features(self, ft_dir: str):
+        logging.info(f"Loading features from {ft_dir}")
+        X, y = [], []
+        for p in glob.glob(os.path.join(ft_dir, "*.npz")):
+            d = np.load(p, allow_pickle=True)
+            feat = np.concatenate([d["x_audio"], d["x_video"], d["x_text"]]).astype(np.float32)
+            label = d["y"].item() if d["y"].shape == () else str(d["y"])
+            X.append(feat); y.append(label)
+        logging.info(f"Loaded {len(X)} feature files")
+        return np.stack(X), np.array(y)
 
-    # ===== LogReg =====
-    if args.model_type=="logreg":
-        clf = Pipeline([
-            ("scaler", StandardScaler()),
-            ("lr", LogisticRegression(max_iter=3000, n_jobs=4, class_weight="balanced"))
-        ])
-        clf.fit(Xtr, ytr)
-        pred = clf.predict(Xte)
-        print(classification_report(yte, pred))
-        joblib.dump(clf, args.model_out)
+    def initiate_model_training(self, features_dir: str):
+        try:
+            X, y = self._load_features(features_dir)
+            Xtr, Xte, ytr, yte = train_test_split(
+                X, y, test_size=0.2, stratify=y, random_state=42
+            )
+            logging.info(f"Train={len(Xtr)} | Test={len(Xte)}")
 
-    # ===== MLP =====
-    elif args.model_type=="mlp":
-        Xtr = StandardScaler().fit_transform(Xtr)
-        Xte = StandardScaler().fit_transform(Xte)
-        model, cls2id, report = train_torch_model(SimpleMLP(Xtr.shape[1], len(np.unique(y))), Xtr, ytr, Xte, yte)
-        print(report)
-        joblib.dump({"model":model.state_dict(),"cls2id":cls2id,"input_dim":Xtr.shape[1]}, args.model_out)
+            candidates = {}
+            preprocessor_to_save = None
 
-    # ===== Transformer Fusion =====
-    elif args.model_type=="transformer":
-        # make tokens = [audio, video, text] → pad dims to same size
-        d_model = max(A.shape[1], V.shape[1], T.shape[1])
-        def pad(x): return np.pad(x, (0,d_model-x.shape[0]))
-        tokens = np.stack([np.apply_along_axis(pad,1,A),
-                           np.apply_along_axis(pad,1,V),
-                           np.apply_along_axis(pad,1,T)], axis=1)  # [N,3,d_model]
-        Xtr, Xte, ytr, yte = train_test_split(tokens, y, test_size=0.2, random_state=42, stratify=y)
-        model, cls2id, report = train_torch_model(TinyTransformer(d_model,len(np.unique(y))), Xtr, ytr, Xte, yte)
-        print(report)
-        joblib.dump({"model":model.state_dict(),"cls2id":cls2id,"d_model":d_model}, args.model_out)
+            # === Logistic Regression ===
+            logging.info("Training Logistic Regression...")
+            logreg_pipe = Pipeline([
+                ("scaler", StandardScaler()),
+                ("lr", LogisticRegression(max_iter=2000, class_weight="balanced"))
+            ])
+            logreg_pipe.fit(Xtr, ytr)
+            preds = logreg_pipe.predict(Xte)
+            score = f1_score(yte, preds, average="macro")
+            logging.info(f"LogReg validation f1_macro={score:.3f}")
+            candidates["LogReg"] = (logreg_pipe, score)
 
-    # ===== Late Fusion =====
-    elif args.model_type=="latefusion":
-        def fit_lr(Xtr,ytr): 
-            pipe = Pipeline([("scaler",StandardScaler()),("lr",LogisticRegression(max_iter=2000,class_weight="balanced"))])
-            pipe.fit(Xtr,ytr); return pipe
-        Xa,Xv,Xt = A,V,T
-        Xa_tr,Xa_te,ya_tr,ya_te = train_test_split(Xa,y,test_size=0.2,random_state=42,stratify=y)
-        Xv_tr,Xv_te,yv_tr,yv_te = train_test_split(Xv,y,test_size=0.2,random_state=42,stratify=y)
-        clf_a,clf_v = fit_lr(Xa_tr,ya_tr), fit_lr(Xv_tr,yv_tr)
-        preds = (clf_a.predict_proba(Xa_te) + clf_v.predict_proba(Xv_te))/2
-        ypred = preds.argmax(1)
-        print(classification_report(yv_te, ypred))
-        joblib.dump({"audio":clf_a,"video":clf_v}, args.model_out)
+            # === Random Forest ===
+            logging.info("Training RandomForest...")
+            rf = RandomForestClassifier(n_estimators=100)
+            rf.fit(Xtr, ytr)
+            preds = rf.predict(Xte)
+            score = f1_score(yte, preds, average="macro")
+            logging.info(f"RandomForest validation f1_macro={score:.3f}")
+            candidates["RandomForest"] = (rf, score)
 
-    print("saved →", args.model_out)
+            # === MLP ===
+            scaler = StandardScaler().fit(Xtr)
+            Xtr_s, Xte_s = scaler.transform(Xtr), scaler.transform(Xte)
+            mlp, cls2id, score = train_mlp(Xtr_s, ytr, Xte_s, yte)
+            candidates["MLP"] = (
+                {"model": mlp.state_dict(), "cls2id": cls2id, "input_dim": Xtr.shape[1]},
+                score,
+            )
 
-if __name__=="__main__":
-    main()
+            # === Late Fusion ===
+            logging.info("Training Late Fusion...")
+            A, V, T, y_all = [], [], [], []
+            for p in glob.glob(os.path.join(features_dir, "*.npz")):
+                d = np.load(p, allow_pickle=True)
+                A.append(d["x_audio"].astype(np.float32))
+                V.append(d["x_video"].astype(np.float32))
+                T.append(d["x_text"].astype(np.float32))
+                y_all.append(d["y"].item() if d["y"].shape==() else str(d["y"]))
+            A, V, T, y_all = np.stack(A), np.stack(V), np.stack(T), np.array(y_all)
+
+            Xa_tr, Xa_te, y_tr, y_te = train_test_split(A, y_all, test_size=0.2, stratify=y_all, random_state=42)
+            Xv_tr, Xv_te, _, _      = train_test_split(V, y_all, test_size=0.2, stratify=y_all, random_state=42)
+
+            clf_a = LogisticRegression(max_iter=2000, class_weight="balanced").fit(Xa_tr, y_tr)
+            clf_v = LogisticRegression(max_iter=2000, class_weight="balanced").fit(Xv_tr, y_tr)
+
+            proba_a = clf_a.predict_proba(Xa_te)
+            proba_v = clf_v.predict_proba(Xv_te)
+            proba_fused = (proba_a + proba_v) / 2
+            preds = proba_fused.argmax(axis=1)
+
+            # Align labels
+            unique_labels = np.unique(y_tr)
+            preds_labels = unique_labels[preds]
+
+            score = f1_score(y_te, preds_labels, average="macro")
+            logging.info(f"Late Fusion validation f1_macro={score:.3f}")
+            candidates["LateFusion"] = ({"audio": clf_a, "video": clf_v}, score)
+
+            # === Pick Best ===
+            best_name, (best_model, best_score) = max(candidates.items(), key=lambda kv: kv[1][1])
+            logging.info(f"Best model: {best_name} (f1_macro={best_score:.3f})")
+
+            # Save best model + preprocessor
+            os.makedirs(os.path.dirname(self.config.model_out), exist_ok=True)
+            joblib.dump(best_model, self.config.model_out)
+
+            if best_name == "MLP":
+                joblib.dump(scaler, self.config.preprocessor_out)
+            elif best_name in ["LogReg"]:
+                joblib.dump(None, self.config.preprocessor_out)
+            elif best_name == "RandomForest":
+                joblib.dump(None, self.config.preprocessor_out)
+            elif best_name == "LateFusion":
+                joblib.dump(None, self.config.preprocessor_out)
+
+            logging.info(f"Saved best model → {self.config.model_out}")
+            logging.info(f"Saved preprocessor → {self.config.preprocessor_out}")
+
+            return {
+                "best_model": best_name,
+                "best_score": best_score,
+                "all_scores": {k: v[1] for k, v in candidates.items()}
+            }
+
+        except Exception as e:
+            raise CustomException(e, sys)
